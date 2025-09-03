@@ -1,10 +1,11 @@
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
+const Chat = require('../models/Chat');
+const User = require('../models/User');
+const Message = require('../models/Message');
 
 const router = express.Router();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // Middleware de autenticação
 router.use((req, res, next) => {
@@ -15,7 +16,7 @@ router.use((req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default_jwt_secret');
     req.user = decoded;
     next();
   } catch (error) {
@@ -23,141 +24,125 @@ router.use((req, res, next) => {
   }
 });
 
-// Criar ou buscar chat individual
+// Criar chat individual
 router.post('/individual', async (req, res) => {
   try {
     const { participantId } = req.body;
 
-    // Verificar se já existe chat entre os usuários
-    const { data: existingChat } = await supabase
-      .from('chat_participants')
-      .select(`
-        chat_id,
-        chats!inner(*)
-      `)
-      .eq('user_id', req.user.userId)
-      .eq('chats.type', 'individual');
+    // Verificar se já existe um chat entre os dois usuários
+    const existingChat = await Chat.findOne({
+      type: 'individual',
+      'participants.user': { $all: [req.user.userId, participantId] }
+    }).populate('participants.user', 'name avatar virtual_number is_online last_seen');
 
-    if (existingChat.length > 0) {
-      for (const participant of existingChat) {
-        const { data: otherParticipant } = await supabase
-          .from('chat_participants')
-          .select('user_id')
-          .eq('chat_id', participant.chat_id)
-          .eq('user_id', participantId);
-
-        if (otherParticipant.length > 0) {
-          return res.json(participant.chats);
-        }
-      }
+    if (existingChat) {
+      return res.json({
+        id: existingChat._id,
+        type: existingChat.type,
+        participants: existingChat.participants.map(p => ({
+          user: {
+            id: p.user._id,
+            name: p.user.name,
+            avatar: p.user.avatar,
+            virtual_number: p.user.virtual_number,
+            is_online: p.user.is_online,
+            last_seen: p.user.last_seen
+          },
+          role: p.role,
+          joined_at: p.joined_at
+        })),
+        created_at: existingChat.createdAt,
+        updated_at: existingChat.updatedAt
+      });
     }
 
     // Criar novo chat
-    const chatId = uuidv4();
-    
-    const { data: newChat, error: chatError } = await supabase
-      .from('chats')
-      .insert([
-        {
-          id: chatId,
-          type: 'individual',
-          created_by: req.user.userId,
-          created_at: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
+    const newChat = new Chat({
+      type: 'individual',
+      participants: [
+        { user: req.user.userId, role: 'member' },
+        { user: participantId, role: 'member' }
+      ]
+    });
 
-    if (chatError) {
-      return res.status(400).json({ error: chatError.message });
-    }
+    await newChat.save();
 
-    // Adicionar participantes
-    const { error: participantsError } = await supabase
-      .from('chat_participants')
-      .insert([
-        {
-          chat_id: chatId,
-          user_id: req.user.userId,
-          joined_at: new Date().toISOString()
+    // Retornar chat com dados dos participantes
+    const chatWithParticipants = await Chat.findById(newChat._id)
+      .populate('participants.user', 'name avatar virtual_number is_online last_seen');
+
+    res.status(201).json({
+      id: chatWithParticipants._id,
+      type: chatWithParticipants.type,
+      participants: chatWithParticipants.participants.map(p => ({
+        user: {
+          id: p.user._id,
+          name: p.user.name,
+          avatar: p.user.avatar,
+          virtual_number: p.user.virtual_number,
+          is_online: p.user.is_online,
+          last_seen: p.user.last_seen
         },
-        {
-          chat_id: chatId,
-          user_id: participantId,
-          joined_at: new Date().toISOString()
-        }
-      ]);
-
-    if (participantsError) {
-      return res.status(400).json({ error: participantsError.message });
-    }
-
-    res.status(201).json(newChat);
-
+        role: p.role,
+        joined_at: p.joined_at
+      })),
+      created_at: chatWithParticipants.createdAt,
+      updated_at: chatWithParticipants.updatedAt
+    });
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao criar chat' });
+    console.error('Erro ao criar chat individual:', error);
+    res.status(500).json({ error: 'Erro ao criar chat individual' });
   }
 });
 
-// Criar grupo
+// Criar chat em grupo
 router.post('/group', async (req, res) => {
   try {
     const { name, description, avatar, participantIds } = req.body;
 
-    const chatId = uuidv4();
-
-    // Criar chat de grupo
-    const { data: newChat, error: chatError } = await supabase
-      .from('chats')
-      .insert([
-        {
-          id: chatId,
-          type: 'group',
-          name,
-          description,
-          avatar,
-          created_by: req.user.userId,
-          created_at: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
-
-    if (chatError) {
-      return res.status(400).json({ error: chatError.message });
-    }
-
-    // Adicionar criador como administrador
+    // Adicionar o criador como admin
     const participants = [
-      {
-        chat_id: chatId,
-        user_id: req.user.userId,
-        role: 'admin',
-        joined_at: new Date().toISOString()
-      }
+      { user: req.user.userId, role: 'admin' },
+      ...participantIds.map(id => ({ user: id, role: 'member' }))
     ];
 
-    // Adicionar outros participantes
-    participantIds.forEach(participantId => {
-      participants.push({
-        chat_id: chatId,
-        user_id: participantId,
-        role: 'member',
-        joined_at: new Date().toISOString()
-      });
+    const newChat = new Chat({
+      name,
+      description,
+      type: 'group',
+      participants,
+      avatar
     });
 
-    const { error: participantsError } = await supabase
-      .from('chat_participants')
-      .insert(participants);
+    await newChat.save();
 
-    if (participantsError) {
-      return res.status(400).json({ error: participantsError.message });
-    }
+    // Retornar chat com dados dos participantes
+    const chatWithParticipants = await Chat.findById(newChat._id)
+      .populate('participants.user', 'name avatar virtual_number is_online last_seen');
 
-    res.status(201).json(newChat);
-
+    res.status(201).json({
+      id: chatWithParticipants._id,
+      name: chatWithParticipants.name,
+      description: chatWithParticipants.description,
+      type: chatWithParticipants.type,
+      avatar: chatWithParticipants.avatar,
+      participants: chatWithParticipants.participants.map(p => ({
+        user: {
+          id: p.user._id,
+          name: p.user.name,
+          avatar: p.user.avatar,
+          virtual_number: p.user.virtual_number,
+          is_online: p.user.is_online,
+          last_seen: p.user.last_seen
+        },
+        role: p.role,
+        joined_at: p.joined_at
+      })),
+      created_at: chatWithParticipants.createdAt,
+      updated_at: chatWithParticipants.updatedAt
+    });
   } catch (error) {
+    console.error('Erro ao criar grupo:', error);
     res.status(500).json({ error: 'Erro ao criar grupo' });
   }
 });
@@ -165,141 +150,88 @@ router.post('/group', async (req, res) => {
 // Listar chats do usuário
 router.get('/', async (req, res) => {
   try {
-    const { data: userChats, error } = await supabase
-      .from('chat_participants')
-      .select(`
-        chat_id,
-        role,
-        joined_at,
-        chats!inner(
-          id,
-          type,
-          name,
-          description,
-          avatar,
-          created_by,
-          created_at,
-          last_message_at
-        )
-      `)
-      .eq('user_id', req.user.userId)
-      .order('chats(last_message_at)', { ascending: false });
+    const chats = await Chat.find({
+      'participants.user': req.user.userId,
+      is_active: true
+    })
+    .populate('participants.user', 'name avatar virtual_number is_online last_seen')
+    .populate('last_message')
+    .sort({ updatedAt: -1 });
 
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
+    const formattedChats = chats.map(chat => ({
+      id: chat._id,
+      name: chat.name,
+      description: chat.description,
+      type: chat.type,
+      avatar: chat.avatar,
+      participants: chat.participants.map(p => ({
+        user: {
+          id: p.user._id,
+          name: p.user.name,
+          avatar: p.user.avatar,
+          virtual_number: p.user.virtual_number,
+          is_online: p.user.is_online,
+          last_seen: p.user.last_seen
+        },
+        role: p.role,
+        joined_at: p.joined_at
+      })),
+      last_message: chat.last_message,
+      created_at: chat.createdAt,
+      updated_at: chat.updatedAt
+    }));
 
-    // Para chats individuais, buscar informações do outro participante
-    const chats = [];
-    
-    for (const userChat of userChats) {
-      const chat = userChat.chats;
-      
-      if (chat.type === 'individual') {
-        // Buscar o outro participante
-        const { data: otherParticipant } = await supabase
-          .from('chat_participants')
-          .select(`
-            users!inner(
-              id,
-              name,
-              virtual_number,
-              avatar,
-              status,
-              is_online,
-              last_seen
-            )
-          `)
-          .eq('chat_id', chat.id)
-          .neq('user_id', req.user.userId)
-          .single();
-
-        if (otherParticipant) {
-          chat.participant = otherParticipant.users;
-        }
-      } else if (chat.type === 'group') {
-        // Para grupos, buscar número de participantes
-        const { data: participantsCount } = await supabase
-          .from('chat_participants')
-          .select('user_id', { count: 'exact' })
-          .eq('chat_id', chat.id);
-
-        chat.participants_count = participantsCount?.length || 0;
-      }
-
-      // Buscar última mensagem
-      const { data: lastMessage } = await supabase
-        .from('messages')
-        .select('content, message_type, sent_at, sender_id')
-        .eq('chat_id', chat.id)
-        .order('sent_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      chat.last_message = lastMessage;
-      chats.push({ ...userChat, chats: chat });
-    }
-
-    res.json(chats);
-
+    res.json(formattedChats);
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao buscar chats' });
+    console.error('Erro ao listar chats:', error);
+    res.status(500).json({ error: 'Erro ao listar chats' });
   }
 });
 
-// Buscar detalhes do chat
+// Obter detalhes de um chat
 router.get('/:chatId', async (req, res) => {
   try {
     const { chatId } = req.params;
 
-    // Verificar se usuário faz parte do chat
-    const { data: participation } = await supabase
-      .from('chat_participants')
-      .select('role')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.userId)
-      .single();
+    const chat = await Chat.findById(chatId)
+      .populate('participants.user', 'name avatar virtual_number is_online last_seen')
+      .populate('last_message');
 
-    if (!participation) {
-      return res.status(403).json({ error: 'Você não tem acesso a este chat' });
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
     }
 
-    // Buscar detalhes do chat
-    const { data: chat, error } = await supabase
-      .from('chats')
-      .select('*')
-      .eq('id', chatId)
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
+    // Verificar se o usuário é participante
+    const isParticipant = chat.participants.some(p => p.user._id.toString() === req.user.userId);
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Acesso negado' });
     }
 
-    // Buscar participantes
-    const { data: participants } = await supabase
-      .from('chat_participants')
-      .select(`
-        role,
-        joined_at,
-        users!inner(
-          id,
-          name,
-          virtual_number,
-          avatar,
-          status,
-          is_online,
-          last_seen
-        )
-      `)
-      .eq('chat_id', chatId);
-
-    chat.participants = participants;
-    chat.user_role = participation.role;
-
-    res.json(chat);
-
+    res.json({
+      id: chat._id,
+      name: chat.name,
+      description: chat.description,
+      type: chat.type,
+      avatar: chat.avatar,
+      participants: chat.participants.map(p => ({
+        user: {
+          id: p.user._id,
+          name: p.user.name,
+          avatar: p.user.avatar,
+          virtual_number: p.user.virtual_number,
+          is_online: p.user.is_online,
+          last_seen: p.user.last_seen
+        },
+        role: p.role,
+        joined_at: p.joined_at
+      })),
+      last_message: chat.last_message,
+      created_at: chat.createdAt,
+      updated_at: chat.updatedAt
+    });
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao buscar chat' });
+    console.error('Erro ao obter chat:', error);
+    res.status(500).json({ error: 'Erro ao obter chat' });
   }
 });
 
@@ -309,39 +241,34 @@ router.post('/:chatId/participants', async (req, res) => {
     const { chatId } = req.params;
     const { participantId } = req.body;
 
-    // Verificar se usuário é admin do grupo
-    const { data: participation } = await supabase
-      .from('chat_participants')
-      .select('role')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.userId)
-      .single();
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
+    }
 
-    if (!participation || participation.role !== 'admin') {
+    if (chat.type !== 'group') {
+      return res.status(400).json({ error: 'Só é possível adicionar participantes em grupos' });
+    }
+
+    // Verificar se o usuário é admin
+    const userParticipant = chat.participants.find(p => p.user.toString() === req.user.userId);
+    if (!userParticipant || userParticipant.role !== 'admin') {
       return res.status(403).json({ error: 'Apenas administradores podem adicionar participantes' });
     }
 
-    // Adicionar participante
-    const { data: newParticipant, error } = await supabase
-      .from('chat_participants')
-      .insert([
-        {
-          chat_id: chatId,
-          user_id: participantId,
-          role: 'member',
-          joined_at: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
+    // Verificar se o participante já está no grupo
+    const existingParticipant = chat.participants.find(p => p.user.toString() === participantId);
+    if (existingParticipant) {
+      return res.status(400).json({ error: 'Usuário já é participante do grupo' });
     }
 
-    res.status(201).json(newParticipant);
+    // Adicionar participante
+    chat.participants.push({ user: participantId, role: 'member' });
+    await chat.save();
 
+    res.json({ message: 'Participante adicionado com sucesso' });
   } catch (error) {
+    console.error('Erro ao adicionar participante:', error);
     res.status(500).json({ error: 'Erro ao adicionar participante' });
   }
 });
@@ -351,32 +278,28 @@ router.delete('/:chatId/participants/:participantId', async (req, res) => {
   try {
     const { chatId, participantId } = req.params;
 
-    // Verificar se usuário é admin do grupo
-    const { data: participation } = await supabase
-      .from('chat_participants')
-      .select('role')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.userId)
-      .single();
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
+    }
 
-    if (!participation || participation.role !== 'admin') {
+    if (chat.type !== 'group') {
+      return res.status(400).json({ error: 'Só é possível remover participantes de grupos' });
+    }
+
+    // Verificar se o usuário é admin
+    const userParticipant = chat.participants.find(p => p.user.toString() === req.user.userId);
+    if (!userParticipant || userParticipant.role !== 'admin') {
       return res.status(403).json({ error: 'Apenas administradores podem remover participantes' });
     }
 
     // Remover participante
-    const { error } = await supabase
-      .from('chat_participants')
-      .delete()
-      .eq('chat_id', chatId)
-      .eq('user_id', participantId);
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
+    chat.participants = chat.participants.filter(p => p.user.toString() !== participantId);
+    await chat.save();
 
     res.json({ message: 'Participante removido com sucesso' });
-
   } catch (error) {
+    console.error('Erro ao remover participante:', error);
     res.status(500).json({ error: 'Erro ao remover participante' });
   }
 });
@@ -386,21 +309,25 @@ router.post('/:chatId/leave', async (req, res) => {
   try {
     const { chatId } = req.params;
 
-    const { error } = await supabase
-      .from('chat_participants')
-      .delete()
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.userId);
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
     }
 
-    res.json({ message: 'Você saiu do grupo com sucesso' });
+    if (chat.type !== 'group') {
+      return res.status(400).json({ error: 'Só é possível sair de grupos' });
+    }
 
+    // Remover usuário dos participantes
+    chat.participants = chat.participants.filter(p => p.user.toString() !== req.user.userId);
+    await chat.save();
+
+    res.json({ message: 'Você saiu do grupo' });
   } catch (error) {
+    console.error('Erro ao sair do grupo:', error);
     res.status(500).json({ error: 'Erro ao sair do grupo' });
   }
 });
 
 module.exports = router;
+
