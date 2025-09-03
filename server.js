@@ -9,7 +9,7 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || "*",
+    origin: process.env.FRONTEND_URL || "https://msg.wuaze.com",
     methods: ["GET", "POST"]
   }
 });
@@ -43,5 +43,5 @@ socketHandler(io);
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`📱 Frontend URL: ${process.env.FRONTEND_URL || "https://msg.wuaze.com/?i=1"}`);
+  console.log(`📱 Frontend URL: ${process.env.FRONTEND_URL || "https://msg.wuaze.com/"}`);
 });
