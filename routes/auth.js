@@ -1,11 +1,10 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { createClient } = require('@supabase/supabase-js');
 const { v4: uuidv4 } = require('uuid');
+const User = require('../models/User');
 
 const router = express.Router();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // Gerar número virtual único
 function generateVirtualNumber() {
@@ -21,11 +20,7 @@ router.post('/register', async (req, res) => {
     const { name, email, password, avatar } = req.body;
 
     // Verificar se email já existe
-    const { data: existingUser } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', email)
-      .single();
+    const existingUser = await User.findOne({ email });
 
     if (existingUser) {
       return res.status(400).json({ error: 'Email já cadastrado' });
@@ -37,45 +32,32 @@ router.post('/register', async (req, res) => {
     
     while (!isUnique) {
       virtualNumber = generateVirtualNumber();
-      const { data } = await supabase
-        .from('users')
-        .select('id')
-        .eq('virtual_number', virtualNumber)
-        .single();
+      const existingNumber = await User.findOne({ virtual_number: virtualNumber });
       
-      if (!data) isUnique = true;
+      if (!existingNumber) isUnique = true;
     }
 
     // Hash da senha
     const hashedPassword = await bcrypt.hash(password, 12);
 
     // Criar usuário
-    const { data: newUser, error } = await supabase
-      .from('users')
-      .insert([
-        {
-          id: uuidv4(),
-          name,
-          email,
-          password: hashedPassword,
-          virtual_number: virtualNumber,
-          avatar: avatar || null,
-          last_seen: new Date().toISOString(),
-          is_online: false,
-          status: 'Disponível'
-        }
-      ])
-      .select()
-      .single();
+    const newUser = new User({
+      name,
+      email,
+      password: hashedPassword,
+      virtual_number: virtualNumber,
+      avatar: avatar || null,
+      last_seen: new Date(),
+      is_online: false,
+      status: 'Disponível'
+    });
 
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
+    await newUser.save();
 
     // Gerar token JWT
     const token = jwt.sign(
-      { userId: newUser.id, virtualNumber: newUser.virtual_number },
-      process.env.JWT_SECRET,
+      { userId: newUser._id, virtualNumber: newUser.virtual_number },
+      process.env.JWT_SECRET || 'default_jwt_secret',
       { expiresIn: '7d' }
     );
 
@@ -83,7 +65,7 @@ router.post('/register', async (req, res) => {
       message: 'Usuário criado com sucesso',
       token,
       user: {
-        id: newUser.id,
+        id: newUser._id,
         name: newUser.name,
         email: newUser.email,
         virtual_number: newUser.virtual_number,
@@ -93,6 +75,7 @@ router.post('/register', async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Erro no registro:', error);
     res.status(500).json({ error: 'Erro interno do servidor' });
   }
 });
@@ -103,13 +86,9 @@ router.post('/login', async (req, res) => {
     const { email, password } = req.body;
 
     // Buscar usuário
-    const { data: user, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .single();
+    const user = await User.findOne({ email });
 
-    if (error || !user) {
+    if (!user) {
       return res.status(400).json({ error: 'Credenciais inválidas' });
     }
 
@@ -121,18 +100,14 @@ router.post('/login', async (req, res) => {
     }
 
     // Atualizar status online
-    await supabase
-      .from('users')
-      .update({ 
-        is_online: true, 
-        last_seen: new Date().toISOString() 
-      })
-      .eq('id', user.id);
+    user.is_online = true;
+    user.last_seen = new Date();
+    await user.save();
 
     // Gerar token JWT
     const token = jwt.sign(
-      { userId: user.id, virtualNumber: user.virtual_number },
-      process.env.JWT_SECRET,
+      { userId: user._id, virtualNumber: user.virtual_number },
+      process.env.JWT_SECRET || 'default_jwt_secret',
       { expiresIn: '7d' }
     );
 
@@ -140,7 +115,7 @@ router.post('/login', async (req, res) => {
       message: 'Login realizado com sucesso',
       token,
       user: {
-        id: user.id,
+        id: user._id,
         name: user.name,
         email: user.email,
         virtual_number: user.virtual_number,
@@ -150,6 +125,7 @@ router.post('/login', async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Erro no login:', error);
     res.status(500).json({ error: 'Erro interno do servidor' });
   }
 });
@@ -163,7 +139,7 @@ router.use((req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default_jwt_secret');
     req.user = decoded;
     next();
   } catch (error) {
@@ -174,14 +150,24 @@ router.use((req, res, next) => {
 // Perfil do usuário
 router.get('/profile', async (req, res) => {
   try {
-    const { data: user } = await supabase
-      .from('users')
-      .select('id, name, email, virtual_number, avatar, status, last_seen, is_online')
-      .eq('id', req.user.userId)
-      .single();
+    const user = await User.findById(req.user.userId).select('-password');
+    
+    if (!user) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
 
-    res.json(user);
+    res.json({
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      virtual_number: user.virtual_number,
+      avatar: user.avatar,
+      status: user.status,
+      last_seen: user.last_seen,
+      is_online: user.is_online
+    });
   } catch (error) {
+    console.error('Erro ao buscar perfil:', error);
     res.status(500).json({ error: 'Erro ao buscar perfil' });
   }
 });
@@ -191,19 +177,26 @@ router.put('/profile', async (req, res) => {
   try {
     const { name, avatar, status } = req.body;
 
-    const { data: updatedUser, error } = await supabase
-      .from('users')
-      .update({ name, avatar, status })
-      .eq('id', req.user.userId)
-      .select()
-      .single();
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user.userId,
+      { name, avatar, status },
+      { new: true }
+    ).select('-password');
 
-    if (error) {
-      return res.status(400).json({ error: error.message });
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
     }
 
-    res.json(updatedUser);
+    res.json({
+      id: updatedUser._id,
+      name: updatedUser.name,
+      email: updatedUser.email,
+      virtual_number: updatedUser.virtual_number,
+      avatar: updatedUser.avatar,
+      status: updatedUser.status
+    });
   } catch (error) {
+    console.error('Erro ao atualizar perfil:', error);
     res.status(500).json({ error: 'Erro ao atualizar perfil' });
   }
 });
